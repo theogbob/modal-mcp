@@ -16,6 +16,7 @@ Provides tools for:
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,9 @@ mcp = FastMCP("modal-mcp-server")
 
 _MODAL_ENV = {**os.environ, "TERM": "dumb", "NO_COLOR": "1", "COLUMNS": "200"}
 
+# Resolve the modal binary path once — uvx/venv may not have it on PATH for Popen
+_MODAL_BIN = shutil.which("modal", path=_MODAL_ENV.get("PATH")) or "modal"
+
 
 def _strip_rich(text: str) -> str:
     """Strip Rich box-drawing characters and ANSI codes."""
@@ -46,7 +50,7 @@ def _strip_rich(text: str) -> str:
 
 def _run(*args: str, timeout: int = 120) -> tuple[bool, str]:
     """Run a modal CLI command. Returns (success, clean_text)."""
-    cmd = ["modal", *args]
+    cmd = [_MODAL_BIN, *args]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_MODAL_ENV)
         out = r.stdout.strip()
@@ -84,7 +88,7 @@ def _run_json(*args: str, timeout: int = 120) -> str:
 def _streaming_capture(*args: str, duration: int = 10) -> str:
     """Run a streaming modal CLI command, capture output for a fixed duration."""
     duration = min(max(duration, 3), 60)
-    cmd = ["modal", *args]
+    cmd = [_MODAL_BIN, *args]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_MODAL_ENV)
         try:
