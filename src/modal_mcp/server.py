@@ -26,6 +26,24 @@ mcp = FastMCP("modal-mcp-server")
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Modal CLI uses Rich for fancy box-drawing output. Force plain text.
+_MODAL_ENV = {**os.environ, "TERM": "dumb", "NO_COLOR": "1", "COLUMNS": "200"}
+
+
+def _strip_rich(text: str) -> str:
+    """Strip Rich box-drawing characters and clean up Modal CLI output."""
+    import re
+    # Remove box-drawing characters (U+2500-U+257F)
+    text = re.sub(r'[\u2500-\u257f]', '', text)
+    # Remove ANSI escape codes
+    text = re.sub(r'\x1b\[[0-9;]*m', '', text)
+    # Collapse multiple spaces/blank lines
+    text = re.sub(r' {2,}', ' ', text)
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    return '\n'.join(lines)
+
+
 def _run_modal_cli(*args: str, timeout: int = 120) -> dict:
     """Run a modal CLI command and return structured output."""
     cmd = ["modal", *args]
@@ -35,36 +53,33 @@ def _run_modal_cli(*args: str, timeout: int = 120) -> dict:
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_MODAL_ENV,
         )
-        return {
-            "success": result.returncode == 0,
-            "command": " ".join(cmd),
-            "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip(),
-            "returncode": result.returncode,
-        }
+        out = result.stdout.strip()
+        err = _strip_rich(result.stderr.strip()) if result.stderr else ""
+
+        resp = {"success": result.returncode == 0}
+        if out:
+            resp["output"] = out
+        if err:
+            resp["error" if result.returncode != 0 else "warnings"] = err
+        return resp
+
     except subprocess.TimeoutExpired:
-        return {
-            "success": False,
-            "command": " ".join(cmd),
-            "error": f"Command timed out after {timeout}s",
-        }
+        return {"success": False, "error": f"Command timed out after {timeout}s"}
     except FileNotFoundError:
-        return {
-            "success": False,
-            "command": " ".join(cmd),
-            "error": "Modal CLI not found. Install with: pip install modal && python3 -m modal setup",
-        }
+        return {"success": False, "error": "Modal CLI not found. Install with: pip install modal && python3 -m modal setup"}
 
 
 def _run_modal_cli_json(*args: str, timeout: int = 120) -> dict:
     """Run a modal CLI command that outputs JSON."""
     result = _run_modal_cli(*args, "--json", timeout=timeout)
-    if result["success"] and result.get("stdout"):
+    if result["success"] and result.get("output"):
         try:
-            result["data"] = json.loads(result["stdout"])
+            result["data"] = json.loads(result["output"])
+            del result["output"]  # don't duplicate raw JSON
         except json.JSONDecodeError:
-            result["data"] = result["stdout"]
+            pass
     return result
 
 
@@ -153,19 +168,51 @@ def stop_app(app_name: str, environment: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-def app_logs(app_name_or_id: str, environment: Optional[str] = None) -> str:
+def app_logs(app_name_or_id: str, duration: int = 10, environment: Optional[str] = None) -> str:
     """Get recent logs for a deployed Modal app.
+
+    Since `modal app logs` streams continuously, this captures logs for
+    a fixed duration and returns what was collected.
 
     Args:
         app_name_or_id: Name or App ID (e.g. "ap-xxxx") of the app
+        duration: Seconds to capture logs for (default: 10, max: 60)
         environment: Optional Modal environment
     """
+    duration = min(max(duration, 3), 60)
     args = ["app", "logs", app_name_or_id]
     if environment:
         args.extend(["--env", environment])
 
-    result = _run_modal_cli(*args, timeout=30)
-    return json.dumps(result, indent=2)
+    cmd = ["modal", *args]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_MODAL_ENV,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=duration)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+
+        out = _strip_rich(stdout) if stdout else ""
+        err = _strip_rich(stderr) if stderr else ""
+
+        if err and not out:
+            return json.dumps({"success": False, "error": err}, indent=2)
+
+        resp = {"success": True, "logs": out}
+        if err:
+            resp["warnings"] = err
+        resp["note"] = f"Captured {duration}s of log stream."
+        return json.dumps(resp, indent=2)
+
+    except FileNotFoundError:
+        return json.dumps({"success": False, "error": "Modal CLI not found."}, indent=2)
 
 
 # ---------------------------------------------------------------------------
