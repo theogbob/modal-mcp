@@ -8,9 +8,9 @@ Provides tools for:
 - Listing deployed apps
 """
 
-import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,65 +26,58 @@ mcp = FastMCP("modal-mcp-server")
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Modal CLI uses Rich for fancy box-drawing output. Force plain text.
 _MODAL_ENV = {**os.environ, "TERM": "dumb", "NO_COLOR": "1", "COLUMNS": "200"}
 
 
 def _strip_rich(text: str) -> str:
-    """Strip Rich box-drawing characters and clean up Modal CLI output."""
-    import re
-    # Remove box-drawing characters (U+2500-U+257F)
+    """Strip Rich box-drawing characters and ANSI codes."""
     text = re.sub(r'[\u2500-\u257f]', '', text)
-    # Remove ANSI escape codes
     text = re.sub(r'\x1b\[[0-9;]*m', '', text)
-    # Collapse multiple spaces/blank lines
     text = re.sub(r' {2,}', ' ', text)
     lines = [line.strip() for line in text.splitlines()]
     lines = [line for line in lines if line]
     return '\n'.join(lines)
 
 
-def _run_modal_cli(*args: str, timeout: int = 120) -> dict:
-    """Run a modal CLI command and return structured output."""
+def _run(*args: str, timeout: int = 120) -> tuple[bool, str]:
+    """Run a modal CLI command. Returns (success, clean_text)."""
     cmd = ["modal", *args]
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_MODAL_ENV,
-        )
-        out = result.stdout.strip()
-        err = _strip_rich(result.stderr.strip()) if result.stderr else ""
-
-        resp = {"success": result.returncode == 0}
-        if out:
-            resp["output"] = out
-        if err:
-            resp["error" if result.returncode != 0 else "warnings"] = err
-        return resp
-
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_MODAL_ENV)
+        out = r.stdout.strip()
+        err = _strip_rich(r.stderr.strip()) if r.stderr else ""
+        if r.returncode == 0:
+            return True, out if out else (err or "OK")
+        return False, f"Error: {err}" if err else f"Command failed (exit {r.returncode})"
     except subprocess.TimeoutExpired:
-        return {"success": False, "error": f"Command timed out after {timeout}s"}
+        return False, f"Command timed out after {timeout}s"
     except FileNotFoundError:
-        return {"success": False, "error": "Modal CLI not found. Install with: pip install modal && python3 -m modal setup"}
+        return False, "Modal CLI not found. Install: pip install modal && python3 -m modal setup"
 
 
-def _run_modal_cli_json(*args: str, timeout: int = 120) -> dict:
-    """Run a modal CLI command that outputs JSON."""
-    result = _run_modal_cli(*args, "--json", timeout=timeout)
-    if result["success"] and result.get("output"):
-        try:
-            result["data"] = json.loads(result["output"])
-            del result["output"]  # don't duplicate raw JSON
-        except json.JSONDecodeError:
-            pass
-    return result
+def _run_json(*args: str, timeout: int = 120) -> str:
+    """Run modal CLI with --json, return readable formatted text."""
+    ok, text = _run(*args, "--json", timeout=timeout)
+    if not ok:
+        return text
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            if not data:
+                return "No results."
+            lines = []
+            for item in data:
+                lines.append('\n'.join(f"  {k}: {v}" for k, v in item.items()))
+            return '\n\n'.join(lines)
+        elif isinstance(data, dict):
+            return '\n'.join(f"{k}: {v}" for k, v in data.items())
+        return str(data)
+    except (json.JSONDecodeError, TypeError):
+        return text
 
 
 # ---------------------------------------------------------------------------
-# App management tools
+# App management
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -93,25 +86,24 @@ def deploy_app(app_path: str, name: Optional[str] = None, environment: Optional[
 
     Args:
         app_path: Absolute path to the Modal application file (e.g. /home/user/my_app.py)
-        name: Optional name for the deployment (overrides the app name in the file)
+        name: Optional name for the deployment
         environment: Optional Modal environment to deploy to
     """
     path = Path(app_path)
     if not path.is_absolute():
-        return json.dumps({"success": False, "error": f"Path must be absolute, got: {app_path}"})
+        return f"Error: Path must be absolute, got: {app_path}"
     if not path.exists():
-        return json.dumps({"success": False, "error": f"File not found: {app_path}"})
-    if not path.suffix == ".py":
-        return json.dumps({"success": False, "error": f"Expected a .py file, got: {path.suffix}"})
+        return f"Error: File not found: {app_path}"
+    if path.suffix != ".py":
+        return f"Error: Expected a .py file, got: {path.suffix}"
 
     args = ["deploy", str(path)]
     if name:
         args.extend(["--name", name])
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli(*args, timeout=300)
-    return json.dumps(result, indent=2)
+    _, text = _run(*args, timeout=300)
+    return text
 
 
 @mcp.tool()
@@ -124,16 +116,15 @@ def run_app(app_path: str, environment: Optional[str] = None) -> str:
     """
     path = Path(app_path)
     if not path.is_absolute():
-        return json.dumps({"success": False, "error": f"Path must be absolute, got: {app_path}"})
+        return f"Error: Path must be absolute, got: {app_path}"
     if not path.exists():
-        return json.dumps({"success": False, "error": f"File not found: {app_path}"})
+        return f"Error: File not found: {app_path}"
 
     args = ["run", str(path)]
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli(*args, timeout=300)
-    return json.dumps(result, indent=2)
+    _, text = _run(*args, timeout=300)
+    return text
 
 
 @mcp.tool()
@@ -146,9 +137,7 @@ def list_apps(environment: Optional[str] = None) -> str:
     args = ["app", "list"]
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli_json(*args)
-    return json.dumps(result, indent=2)
+    return _run_json(*args)
 
 
 @mcp.tool()
@@ -162,21 +151,19 @@ def stop_app(app_name: str, environment: Optional[str] = None) -> str:
     args = ["app", "stop", app_name]
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli(*args)
-    return json.dumps(result, indent=2)
+    _, text = _run(*args)
+    return text
 
 
 @mcp.tool()
 def app_logs(app_name_or_id: str, duration: int = 10, environment: Optional[str] = None) -> str:
     """Get recent logs for a deployed Modal app.
 
-    Since `modal app logs` streams continuously, this captures logs for
-    a fixed duration and returns what was collected.
+    Streams are captured for a fixed duration then returned.
 
     Args:
         app_name_or_id: Name or App ID (e.g. "ap-xxxx") of the app
-        duration: Seconds to capture logs for (default: 10, max: 60)
+        duration: Seconds to capture (default: 10, max: 60)
         environment: Optional Modal environment
     """
     duration = min(max(duration, 3), 60)
@@ -186,13 +173,7 @@ def app_logs(app_name_or_id: str, duration: int = 10, environment: Optional[str]
 
     cmd = ["modal", *args]
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=_MODAL_ENV,
-        )
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=_MODAL_ENV)
         try:
             stdout, stderr = proc.communicate(timeout=duration)
         except subprocess.TimeoutExpired:
@@ -203,20 +184,20 @@ def app_logs(app_name_or_id: str, duration: int = 10, environment: Optional[str]
         err = _strip_rich(stderr) if stderr else ""
 
         if err and not out:
-            return json.dumps({"success": False, "error": err}, indent=2)
+            return f"Error: {err}"
 
-        resp = {"success": True, "logs": out}
-        if err:
-            resp["warnings"] = err
-        resp["note"] = f"Captured {duration}s of log stream."
-        return json.dumps(resp, indent=2)
+        if len(out) > 30000:
+            head, tail = out[:5000], out[-25000:]
+            out = f"{head}\n\n... [truncated middle] ...\n\n{tail}"
+
+        return f"{out}\n\n(Captured {duration}s of log stream)" if out else f"No logs captured in {duration}s."
 
     except FileNotFoundError:
-        return json.dumps({"success": False, "error": "Modal CLI not found."}, indent=2)
+        return "Error: Modal CLI not found."
 
 
 # ---------------------------------------------------------------------------
-# Volume tools
+# Volume management
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -229,9 +210,7 @@ def list_volumes(environment: Optional[str] = None) -> str:
     args = ["volume", "list"]
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli_json(*args)
-    return json.dumps(result, indent=2)
+    return _run_json(*args)
 
 
 @mcp.tool()
@@ -240,15 +219,14 @@ def list_volume_contents(volume_name: str, path: str = "/", environment: Optiona
 
     Args:
         volume_name: Name of the Modal volume
-        path: Path within the volume (default: root "/")
+        path: Path within the volume (default: "/")
         environment: Optional Modal environment
     """
     args = ["volume", "ls", volume_name, path]
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli(*args)
-    return json.dumps(result, indent=2)
+    _, text = _run(*args)
+    return text
 
 
 @mcp.tool()
@@ -262,9 +240,8 @@ def create_volume(volume_name: str, environment: Optional[str] = None) -> str:
     args = ["volume", "create", volume_name]
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli(*args)
-    return json.dumps(result, indent=2)
+    _, text = _run(*args)
+    return text
 
 
 @mcp.tool()
@@ -277,17 +254,13 @@ def delete_volume(volume_name: str, confirm: bool = False, environment: Optional
         environment: Optional Modal environment
     """
     if not confirm:
-        return json.dumps({
-            "success": False,
-            "error": "Safety check: set confirm=True to actually delete the volume. This cannot be undone.",
-        })
+        return "Safety check: set confirm=True to actually delete the volume. This cannot be undone."
 
     args = ["volume", "delete", volume_name, "--yes"]
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli(*args)
-    return json.dumps(result, indent=2)
+    _, text = _run(*args)
+    return text
 
 
 @mcp.tool()
@@ -296,32 +269,31 @@ def upload_to_volume(volume_name: str, local_path: str, remote_path: str = "/", 
 
     Args:
         volume_name: Name of the Modal volume
-        local_path: Path to the local file or directory to upload
+        local_path: Path to the local file or directory
         remote_path: Destination path in the volume (default: "/")
         force: Overwrite existing files if True
         environment: Optional Modal environment
     """
     if not Path(local_path).exists():
-        return json.dumps({"success": False, "error": f"Local path not found: {local_path}"})
+        return f"Error: Local path not found: {local_path}"
 
     args = ["volume", "put", volume_name, local_path, remote_path]
     if force:
         args.append("--force")
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli(*args)
-    return json.dumps(result, indent=2)
+    _, text = _run(*args)
+    return text
 
 
 @mcp.tool()
 def download_from_volume(volume_name: str, remote_path: str, local_path: str = ".", force: bool = False, environment: Optional[str] = None) -> str:
-    """Download files from a Modal volume to a local path.
+    """Download files from a Modal volume to local disk.
 
     Args:
         volume_name: Name of the Modal volume
         remote_path: Path within the volume to download
-        local_path: Local destination path (default: current directory)
+        local_path: Local destination (default: current directory)
         force: Overwrite existing local files if True
         environment: Optional Modal environment
     """
@@ -330,9 +302,8 @@ def download_from_volume(volume_name: str, remote_path: str, local_path: str = "
         args.append("--force")
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli(*args)
-    return json.dumps(result, indent=2)
+    _, text = _run(*args)
+    return text
 
 
 @mcp.tool()
@@ -350,13 +321,12 @@ def remove_volume_file(volume_name: str, remote_path: str, recursive: bool = Fal
         args.append("-r")
     if environment:
         args.extend(["--env", environment])
-
-    result = _run_modal_cli(*args)
-    return json.dumps(result, indent=2)
+    _, text = _run(*args)
+    return text
 
 
 # ---------------------------------------------------------------------------
-# Sandbox tools
+# Sandboxes
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -369,37 +339,27 @@ def run_sandbox_command(
     gpu: Optional[str] = None,
     environment: Optional[str] = None,
 ) -> str:
-    """Run a command in a Modal sandbox (ephemeral container).
-
-    This creates a temporary sandbox, runs the command, and returns the output.
-    Useful for running arbitrary code in the cloud without deploying an app.
+    """Run a command in a Modal sandbox (ephemeral cloud container).
 
     Args:
         command: Shell command to execute (e.g. "python -c 'print(1+1)'" or "ls /")
         image: Base image - "debian_slim" (default) or "ubuntu"
-        python_version: Python version for the image (default: "3.12")
-        pip_packages: Optional list of pip packages to install (e.g. ["numpy", "pandas"])
-        timeout: Max seconds to wait (default: 120)
+        python_version: Python version (default: "3.12")
+        pip_packages: Optional pip packages to install (e.g. ["numpy", "pandas"])
+        timeout: Max seconds (default: 120)
         gpu: Optional GPU type (e.g. "T4", "A10G", "A100", "H100")
         environment: Optional Modal environment
     """
-    # Build a small Python script that uses the Modal SDK to create a sandbox
     pip_install = ""
     if pip_packages:
         pkgs = ", ".join(f'"{p}"' for p in pip_packages)
         pip_install = f'.pip_install([{pkgs}])'
 
-    gpu_arg = ""
-    if gpu:
-        gpu_arg = f', gpu="{gpu}"'
-
-    env_arg = ""
-    if environment:
-        env_arg = f', environment_name="{environment}"'
+    gpu_arg = f', gpu="{gpu}"' if gpu else ""
+    env_arg = f', environment_name="{environment}"' if environment else ""
 
     script = f'''
 import modal
-import sys
 
 image = modal.Image.{image}(python_version="{python_version}"){pip_install}
 
@@ -422,34 +382,34 @@ print(f"===RC={{rc}}===")
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(script)
-        f.flush()
         tmp_path = f.name
 
     try:
-        result = subprocess.run(
+        r = subprocess.run(
             [sys.executable, tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=timeout + 60,  # extra buffer for image build
+            capture_output=True, text=True,
+            timeout=timeout + 60, env=_MODAL_ENV,
         )
 
-        output = result.stdout
-        # Parse the structured output
-        parts = {}
+        output = r.stdout
+        sb_out = sb_err = ""
         if "===STDOUT===" in output:
-            parts["sandbox_stdout"] = output.split("===STDOUT===")[1].split("===STDERR===")[0].strip()
+            sb_out = output.split("===STDOUT===")[1].split("===STDERR===")[0].strip()
         if "===STDERR===" in output:
-            parts["sandbox_stderr"] = output.split("===STDERR===")[1].split("===RC===")[0].strip()
+            sb_err = output.split("===STDERR===")[1].split("===RC===")[0].strip()
 
-        return json.dumps({
-            "success": result.returncode == 0,
-            "sandbox_output": parts.get("sandbox_stdout", ""),
-            "sandbox_errors": parts.get("sandbox_stderr", ""),
-            "runner_stderr": result.stderr.strip() if result.stderr else "",
-        }, indent=2)
+        lines = []
+        if sb_out:
+            lines.append(sb_out)
+        if sb_err:
+            lines.append(f"Stderr: {sb_err}")
+        if r.stderr and r.stderr.strip():
+            lines.append(f"Runner: {_strip_rich(r.stderr.strip())}")
+
+        return '\n'.join(lines) if lines else "Sandbox completed with no output."
 
     except subprocess.TimeoutExpired:
-        return json.dumps({"success": False, "error": f"Sandbox timed out after {timeout + 60}s"})
+        return f"Error: Sandbox timed out after {timeout + 60}s"
     finally:
         os.unlink(tmp_path)
 
@@ -462,26 +422,17 @@ def run_python_in_sandbox(
     timeout: int = 120,
     gpu: Optional[str] = None,
 ) -> str:
-    """Run Python code in a Modal sandbox. The code is executed as a script.
+    """Run Python code in a Modal sandbox.
 
     Args:
         code: Python code to execute
-        pip_packages: Optional list of pip packages to install
+        pip_packages: Optional pip packages to install
         python_version: Python version (default: "3.12")
         timeout: Max seconds (default: 120)
         gpu: Optional GPU type (e.g. "T4", "A10G", "A100", "H100")
     """
-    # Write code to a temp file, then use run_sandbox_command
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, dir="/tmp") as f:
-        f.write(code)
-        f.flush()
-        code_escaped = code.replace("'", "'\\''").replace('"', '\\"')
-
-    # Use a heredoc-style approach to pass code safely
-    command = f"python3 -c {json.dumps(code)}"
-
     return run_sandbox_command(
-        command=command,
+        command=f"python3 -c {json.dumps(code)}",
         pip_packages=pip_packages,
         python_version=python_version,
         timeout=timeout,
@@ -490,7 +441,7 @@ def run_python_in_sandbox(
 
 
 # ---------------------------------------------------------------------------
-# Secret tools
+# Secrets / environments / profile
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -503,27 +454,22 @@ def list_secrets(environment: Optional[str] = None) -> str:
     args = ["secret", "list"]
     if environment:
         args.extend(["--env", environment])
+    _, text = _run(*args)
+    return text
 
-    result = _run_modal_cli(*args)
-    return json.dumps(result, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Environment & profile tools
-# ---------------------------------------------------------------------------
 
 @mcp.tool()
 def current_profile() -> str:
     """Show the current Modal profile (workspace/user info)."""
-    result = _run_modal_cli("profile", "current")
-    return json.dumps(result, indent=2)
+    _, text = _run("profile", "current")
+    return text
 
 
 @mcp.tool()
 def list_environments() -> str:
     """List all Modal environments in the current workspace."""
-    result = _run_modal_cli("environment", "list")
-    return json.dumps(result, indent=2)
+    _, text = _run("environment", "list")
+    return text
 
 
 # ---------------------------------------------------------------------------
