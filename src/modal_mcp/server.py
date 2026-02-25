@@ -153,14 +153,14 @@ def stop_app(app_name: str, environment: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-def app_logs(app_name: str, environment: Optional[str] = None) -> str:
+def app_logs(app_name_or_id: str, environment: Optional[str] = None) -> str:
     """Get recent logs for a deployed Modal app.
 
     Args:
-        app_name: Name of the app
+        app_name_or_id: Name or App ID (e.g. "ap-xxxx") of the app
         environment: Optional Modal environment
     """
-    args = ["container", "logs", app_name]
+    args = ["app", "logs", app_name_or_id]
     if environment:
         args.extend(["--env", environment])
 
